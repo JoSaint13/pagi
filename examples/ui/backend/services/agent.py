@@ -2,9 +2,12 @@
 Agent service for the PandaAGI SDK API.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+import os
 import uuid
 from typing import AsyncGenerator, Optional, Tuple
 
@@ -15,10 +18,18 @@ from panda_agi.envs import E2BEnv
 from panda_agi.envs.local_env import LocalEnv
 
 from .chat_env import get_env
+from .mediator import AgentMediator
 
 logger = logging.getLogger("panda_agi_api")
 
 MODEL = "annie-pro"
+BRIDGE_MODES = {"bridge", "mediator", "bridge-mediator"}
+
+
+def mediator_enabled() -> bool:
+    """Return True when the chat runtime should use the mediator stub."""
+
+    return os.getenv("CHAT_RUNTIME", "panda-agent").lower() in BRIDGE_MODES
 
 
 async def get_or_create_agent(
@@ -33,6 +44,12 @@ async def get_or_create_agent(
     Returns:
         Tuple[Agent, str]: The agent and conversation ID
     """
+
+    if mediator_enabled():
+        raise RuntimeError(
+            "Local agent runtime is disabled when CHAT_RUNTIME is set to a mediator mode."
+        )
+
     new_conversation_id = conversation_id or str(uuid.uuid4())
 
     local_env: E2BEnv | LocalEnv = await get_env(
@@ -69,13 +86,26 @@ async def event_stream(
         AsyncGenerator[str, None]: Stream of SSE events
     """
     agent = None
+    mediator = None
     actual_conversation_id = None
 
     try:
-        # Get or create agent for this conversation
-        agent, actual_conversation_id = await get_or_create_agent(
-            conversation_id, api_key
-        )
+        if mediator_enabled():
+            mediator = AgentMediator(conversation_id, api_key)
+            actual_conversation_id = mediator.conversation_id
+            event_iterator = mediator.stream(query)
+            logger.debug(
+                "Using AgentMediator for conversation %s", actual_conversation_id
+            )
+        else:
+            # Get or create agent for this conversation
+            agent, actual_conversation_id = await get_or_create_agent(
+                conversation_id, api_key
+            )
+            event_iterator = agent.run_stream(query)
+            logger.debug(
+                "Using PandaAGI Agent for conversation %s", actual_conversation_id
+            )
 
         # Send conversation ID as first event
         conversation_event = {
@@ -90,14 +120,13 @@ async def event_stream(
         await asyncio.sleep(0.01)
 
         # Stream events
-        async for event in agent.run_stream(query):
-            # Apply filtering first
-
-            if not should_render_event(event):
-                continue
-
+        async for event in event_iterator:
             if event is None:
                 # Skip events that couldn't be processed
+                continue
+
+            # Apply filtering first
+            if not should_render_event(event):
                 continue
 
             # Format as SSE

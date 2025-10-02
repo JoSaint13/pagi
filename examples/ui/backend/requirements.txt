@@ -11,3 +11,4 @@ plotly>=5.15.0
 kaleido>=0.2.1
 panda-agi>=0.6.2
 aiohttp
+httpx>=0.24.0

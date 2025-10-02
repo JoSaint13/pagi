@@ -33,9 +33,27 @@ FRONTEND_URL="http://localhost:3000"
 COMPOSE_FILE="docker-compose.yml"
 COMPOSE_OVERRIDE="docker-compose.override.yml"
 ENV_FILE=".env"
+START_SERVICES_ERROR=""
 
 # Required environment variables
 REQUIRED_ENV_VARS=("PANDA_AGI_KEY" "TAVILY_API_KEY")
+
+# Resolve docker compose command (supports v1 and v2 CLIs)
+resolve_docker_compose_cmd() {
+  if command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD=("docker-compose")
+    DOCKER_COMPOSE_DISPLAY="docker-compose"
+    return 0
+  fi
+
+  if docker compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD=("docker" "compose")
+    DOCKER_COMPOSE_DISPLAY="docker compose"
+    return 0
+  fi
+
+  return 1
+}
 
 # Parse command line arguments
 BUILD_IMAGES=false
@@ -181,14 +199,15 @@ build_images() {
     else
       status "🔨 Building Docker images for development..."
     fi
-    
-    if ! docker-compose -f docker-compose.yml build $build_args; then
+    local compose_cmd=("${DOCKER_COMPOSE_CMD[@]}" "-f" "docker-compose.yml")
+    if ! "${compose_cmd[@]}" build $build_args; then
       error "Failed to build Docker images. Check the logs for details."
     fi
   elif [ "$BUILD_IMAGES" = true ] && [ "$USE_PROD" = true ]; then
     # Production mode with --build flag: pull latest images from registry
     status "📥 Pulling latest Docker images from registry..."
-    if ! docker-compose -f "$COMPOSE_FILE" pull; then
+    local compose_cmd=("${DOCKER_COMPOSE_CMD[@]}" "-f" "$COMPOSE_FILE")
+    if ! "${compose_cmd[@]}" pull; then
       error "Failed to pull Docker images. Check the logs for details."
     fi
   fi
@@ -196,7 +215,7 @@ build_images() {
 
 # Function to start services
 start_services() {
-  local compose_cmd=("docker-compose" "-f" "$COMPOSE_FILE")
+  local compose_cmd=("${DOCKER_COMPOSE_CMD[@]}" "-f" "$COMPOSE_FILE")
   
   if [ -f "$COMPOSE_OVERRIDE" ]; then
     compose_cmd+=("-f" "$COMPOSE_OVERRIDE")
@@ -208,9 +227,20 @@ start_services() {
     status "🚀 Starting development services..."
   fi
   
-  if ! "${compose_cmd[@]}" up -d; then
-    error "Failed to start services. Check the logs with 'docker-compose logs' for more details."
+  set +e
+  local output
+  output=$("${compose_cmd[@]}" up -d 2>&1)
+  local status=$?
+  set -e
+
+  if [ $status -ne 0 ]; then
+    START_SERVICES_ERROR="$output"
+    echo "$output"
+    return 1
   fi
+
+  START_SERVICES_ERROR=""
+  return 0
 }
 
 # Function to check if a URL is available
@@ -238,12 +268,24 @@ check_url() {
 
 # Function to stop services
 stop_services() {
+    local compose_file_override="${1:-$COMPOSE_FILE}"
     status "🛑 Stopping services..."
-    local compose_cmd=("docker-compose" "-f" "$COMPOSE_FILE")
+    local compose_cmd=("${DOCKER_COMPOSE_CMD[@]}" "-f" "$compose_file_override")
     if [ -f "$COMPOSE_OVERRIDE" ]; then
         compose_cmd+=("-f" "$COMPOSE_OVERRIDE")
     fi
-    "${compose_cmd[@]}" down --remove-orphans
+    "${compose_cmd[@]}" down --remove-orphans 2>/dev/null || true
+}
+
+# Wrapper to stop, build and start services for current mode
+run_stack() {
+    local compose_file_snapshot="$COMPOSE_FILE"
+    stop_services "$compose_file_snapshot"
+    build_images
+    if ! start_services; then
+        return 1
+    fi
+    return 0
 }
 
 # Main execution
@@ -259,18 +301,36 @@ main() {
         error "Docker daemon is not running. Please start Docker and try again."
     fi
 
-    if ! command -v docker-compose &> /dev/null; then
-        error "docker-compose is not installed. Please install docker-compose and try again."
+    if ! resolve_docker_compose_cmd; then
+        error "Docker Compose is not installed. Install ${BLUE}docker compose${NC} or ${BLUE}docker-compose${NC} and try again."
     fi
 
-    # Stop any running services first
-    stop_services
+    if ! run_stack; then
+        if [ "$USE_PROD" = true ]; then
+            warning "Production startup failed."
+            if [ -n "$START_SERVICES_ERROR" ]; then
+                if echo "$START_SERVICES_ERROR" | grep -qi "ghcr\.io"; then
+                    warning "Unable to pull pre-built images from ghcr.io. This can happen without network access or GHCR credentials."
+                    warning "Falling back to local development build (./start.sh --dev)."
+                else
+                    warning "Compose output:\n$START_SERVICES_ERROR"
+                fi
+            fi
 
-    # Build images if needed
-    build_images
-    
-    # Start services
-    start_services
+            USE_PROD=false
+            COMPOSE_FILE="docker-compose.yml"
+
+            if ! run_stack; then
+                error "Failed to start services even in development mode. Check the logs above for details."
+            fi
+        else
+            if [ -n "$START_SERVICES_ERROR" ]; then
+                error "Failed to start services. Compose output:\n$START_SERVICES_ERROR"
+            else
+                error "Failed to start services."
+            fi
+        fi
+    fi
 
     # Check services in parallel
     status "⏳ Waiting for services to become ready..."
@@ -297,7 +357,7 @@ main() {
     if [ $backend_status -eq 0 ]; then
         echo -e "${GREEN}✅ Backend is up and running!${NC}"
     else
-        warning "Backend is not responding. Check logs with: docker-compose -f $COMPOSE_FILE logs backend"
+        warning "Backend is not responding. Check logs with: ${DOCKER_COMPOSE_DISPLAY} -f $COMPOSE_FILE logs backend"
     fi
 
     if [ $frontend_status -eq 0 ]; then
@@ -308,10 +368,10 @@ main() {
 
     # Display usage information
     echo -e "\n🔧 ${GREEN}Useful commands:${NC}"
-    echo "  View logs:             docker-compose -f $COMPOSE_FILE logs -f"
-    echo "  View backend logs:     docker-compose -f $COMPOSE_FILE logs -f backend"
-    echo "  View frontend logs:    docker-compose -f $COMPOSE_FILE logs -f frontend"
-    echo "  Stop services:         docker-compose -f $COMPOSE_FILE down"
+    echo "  View logs:             ${DOCKER_COMPOSE_DISPLAY} -f $COMPOSE_FILE logs -f"
+    echo "  View backend logs:     ${DOCKER_COMPOSE_DISPLAY} -f $COMPOSE_FILE logs -f backend"
+    echo "  View frontend logs:    ${DOCKER_COMPOSE_DISPLAY} -f $COMPOSE_FILE logs -f frontend"
+    echo "  Stop services:         ${DOCKER_COMPOSE_DISPLAY} -f $COMPOSE_FILE down"
     echo ""
     echo "  Development mode:      ./start.sh --dev"
     echo "  Rebuild (cached):      ./start.sh --dev --build"
@@ -329,4 +389,4 @@ main() {
 }
 
 # Run the main function
-main "$@" 
+main "$@"

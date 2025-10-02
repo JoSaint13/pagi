@@ -4,6 +4,8 @@ A modern React frontend for the PandaAGI SDK that provides a beautiful chat inte
 
 > **🚀 Quick Start:** `cd examples/ui && ./start.sh` - One command to run everything with Docker!
 
+> **🍷 Wine Marketing Integration:** This UI now supports the Wine Customer Analytics Platform. See [INTEGRATION.md](INTEGRATION.md) for setup instructions.
+
 ## Features
 
 - 🎨 **Modern Chat Interface**: Beautiful, responsive design with Tailwind CSS
@@ -471,3 +473,16 @@ If you encounter issues with event handling, ensure you're using the latest vers
 ## License
 
 This project is part of the PandaAGI SDK. Please refer to the main project license.
+
+## Bridge Runtime (Experimental)
+
+You can bypass the bundled PandaAGI agent and exercise the chat UI against a
+placeholder mediator while you wire up MCP or agent-to-agent transports. Start
+the services with the environment variable `CHAT_RUNTIME=bridge` (or
+`bridge-mediator`) and the backend will stream mock events from
+`examples/ui/backend/services/mediator.py`. The mock keeps the response shape the
+frontend expects, so you can focus on integrating your own bridge logic.
+
+> **Heads up:** file tooling still depends on the PandaAGI environment helpers.
+> When the bridge runtime is enabled the upload/download routes raise a 500 until
+you replace them with equivalents that talk to your downstream system.
